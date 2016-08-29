@@ -1,7 +1,34 @@
 
+dumi = function(files, EM="global", mer.filter=0.01, aer.filter=0.01, verbose=TRUE) {
+
+  bfl = BamFileList(files)
+  
+  ## Get summary stats for all files
+  bam.align = countBam(bfl, param=ScanBamParam(scanBamFlag(isUnmappedQuery=FALSE, isNotPassingQualityControls=FALSE)))
+  bam.unalign = countBam(bfl, param=ScanBamParam(scanBamFlag(isUnmappedQuery=TRUE)))
+  bam.low.q = countBam(bfl, param=ScanBamParam(scanBamFlag(isUnmappedQuery=FALSE, isNotPassingQualityControls=TRUE)))
+  
+  ## Perform EM for each cell individually
+
+  cell.mer = rep(NA, length(files))
+  cell.mer.counts = rep(NA, length(files))
+  cell.aer = rep(NA, length(files))  
+  cell.aer.counts = rep(NA, length(files))
+    
+  for(i in 1:length(files)) {
+    bem = barcodeEM(files(i), verbose=verbose)
+    cell.aer[i] = bem$aer
+    cell.mer[i] = bem$mer
+    
+    
+  }
+}
 
 
-barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05, alignment.error.rate = rep(1, (window*2)+1) / ((window*2)+1), max.iter=10) {
+
+
+
+barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05, alignment.error.rate = rep(1, (window*2)+1) / ((window*2)+1), max.iter=10, verbose=TRUE) {
   suppressPackageStartupMessages(require(stringr))
   suppressPackageStartupMessages(require(GenomicAlignments))
   suppressPackageStartupMessages(require(data.table))
@@ -9,29 +36,17 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
 
   bamGA = readGAlignments(filename, param=ScanBamParam(what=c("qname", "flag")))
   
-  if(length(umi.flag) == 1 & class(umi.flag) %in% c("numeric", "integer")) {
-    umi = str_sub(mcols(bamGA)$qname, start=-umi.flag)
-  } else if(length(umi.flag) == 2 & class(umi.flag) %in% c("numeric", "integer")) {  
-    umi = str_sub(mcols(bamGA)$qname, start=umi.flag[1], end=umi.flag[2])
-  } else if(length(umi.flag) == 1 & class(umi.flag) == "character") {
-    umi = str_match(mcols(bamGA)$qname, pattern=umi.flag)[,2]
-    if(sum(is.na(umi)) > 0) {
-      stop(paste("UMIs not found for ", sum(is.na(umi)), " reads. Please check matching pattern", sep=""))
-  } else {
-    stop("umi.flag not in a recognized format. See ?barcodeEM for details.")
-  }
-
+  umi = read.umi(mcols(bamGA)$qname, umi.flag)
 
   position = start(bamGA)
   strand = as.factor(strand(bamGA)) == "+"
   position[!strand] = end(bamGA)[!strand]
 
   info = data.table(data.frame(chr=seqnames(bamGA), position=position, strand=strand, umi=umi, inferred_position=position, inferred_umi=umi))
-  info.counts = info[, `:=` (COUNT = .N, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
+  info.counts = info[, `:=` (COUNT = .N, INITIAL_GRP=.GRP, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
   info.counts = info.counts[,ID := 1:nrow(info.counts)]
   info.counts[IX > 1,COUNT := 0]
   info.counts.u = subset(info.counts, IX==1)
-  info.counts[,IX := NULL]
      
   ## Set up shorthand variables for use in rest of script
   aer = alignment.error.rate
@@ -44,14 +59,10 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
   ## Set up variables to save info after each iteration
   previous.umi = info.counts$inferred_umi
   previous.position = info.counts$inferred_position
-  mer.list = list(mer)
-  aer.list = list(aer)
+  mer.list = list()
+  aer.list = list()
   info.list = list(info.counts.u)
 
-  ## Set up mismatch and alignment error probability matrix
-  probs = do.call(cbind, lapply(1:w.size, function(i) aer[i] * dbinom(x=0:umi.len, size=umi.len, prob=mer)))
-  rownames(probs) = 0:umi.len
-  colnames(probs) = names(aer)
   
   iter = 1
   continue = TRUE
@@ -60,7 +71,11 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
 	next.umi = c()
 	next.position = c()
 
-	print(sprintf("Expectation ... Calculating most likely fragment memberships"))
+    ## Set up mismatch and alignment error probability matrix
+    probs = get.probability.matrix(umi.len, mer, aer)
+
+	if(verbose) print(sprintf("Expectation ... Calculating most likely fragment memberships"))
+	
 	for(ix in 1:nrow(info.counts.u)) {
 	  current.umi = as.character(info.counts.u[ix,inferred_umi])
 	  current.position = info.counts.u[ix,inferred_position]
@@ -87,13 +102,15 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
 	  next.position = c(next.position, info.counts.u$inferred_position[reads.ix][ll.max.ix])
 	}
  
-	print(sprintf("Maximization ... Calculating new mismatch error rate"))
-	mer = calcMismatchErrorRate(info.counts.u$umi, next.umi, info.counts.u$COUNT)
-	mer.list = c(mer.list, mer)
+	if(verbose) print(sprintf("Maximization ... Calculating new mismatch error rate"))
+	mer.temp = calcMismatchErrorRate(info.counts.u$umi, next.umi, info.counts.u$COUNT)
+	mer = mer.temp[1]
+	mer.list = c(mer.list, list(mer.temp))
   
-	print(sprintf("Maximization ... Calculating new alignment error rate"))
-	aer = calcAlignmentErrorRate(info.counts.u$position, next.position, info.counts.u$strand, info.counts.u$COUNT, window=w)
-	aer.list = c(aer.list, list(aer))
+	if(verbose) print(sprintf("Maximization ... Calculating new alignment error rate"))
+	aer.temp = calcAlignmentErrorRate(info.counts.u$position, next.position, info.counts.u$strand, info.counts.u$COUNT, window=w)
+	aer = aer.temp[[1]]
+	aer.list = c(aer.list, list(aer.temp))
   
     
     info.counts.u$inferred_umi = next.umi
@@ -113,30 +130,28 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
     # Update current UMI and position assignments
     info.list = c(info.list, list(info.counts.u))
   
-	print(sprintf("Completed iteration %d", iter))
+	if(verbose) print(sprintf("Completed iteration %d", iter))
 	iter = iter + 1
 	
 	total.diff = sum(!(info.counts$inferred_umi == previous.umi & info.counts$inferred_position == previous.position))
-	print(sprintf("Total number of reads that changed fragment membership: %d", total.diff))
+	if(verbose) print(sprintf("Total number of reads that changed fragment membership: %d", total.diff))
 	if(total.diff == 0) {
 	  continue = FALSE
 	}
 	previous.umi = info.counts$inferred_umi
 	previous.position = info.counts$inferred_position
-
-	
   }
   
   ## Make a final read matrix with duplicate infomation
   final.counts = info.counts
   final.counts[,`:=` (COUNT = NULL, IX = NULL)]
   same.fragment = final.counts$umi == final.counts$inferred_umi & final.counts$position == final.counts$position
-  final.counts[,`:=`(same=same.fragment, duplicate = FALSE)]
-  final.counts = final.counts[, `:=` (COUNT = .N, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi, same)]
+  final.counts[,`:=` (same=same.fragment, duplicate = FALSE)]
+  final.counts = final.counts[, `:=` (FINAL_GRP = .GRP, COUNT = .N, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi, same)]
   ind = final.counts$IX > 1 | !same.fragment
   final.counts$duplicate[ind] = TRUE 
 
-  return(final.counts, list(info.list, info.counts, aer, mer, aer.list, mer.list, next.umi, next.position))
+  return(list(final.counts, list(info.list, info.counts, aer, mer, aer.list, mer.list, next.umi, next.position)))
 }
 
 calcMismatchErrorRate = function(actual.umi, inferred.umi, counts) {
@@ -144,8 +159,12 @@ calcMismatchErrorRate = function(actual.umi, inferred.umi, counts) {
   inferred.umi = as.character(inferred.umi)
   c = cbind(as.character(actual.umi), as.character(inferred.umi))
   l = unlist(lapply(1:nrow(c), function(i) stringDist(c(c[i,1], c[i,2]), method="hamming")[1]))
-  new.mer = sum(l*counts) / sum(counts*nchar(actual.umi[1]))
-  return(new.mer)
+  
+  mer.num = sum(l*counts)
+  mer.denom = sum(counts*nchar(actual.umi[1]))
+  new.mer =  mer.num / mer.denom
+  
+  return(c(new.mer, mer.num, mer.denom))
 }
 
 
@@ -156,7 +175,7 @@ calcAlignmentErrorRate = function(actual.position, inferred.position, strand, co
   names(new.aer) = (-window):(window)
   
   new.aer.forward = factor(inferred.position[strand] - actual.position[strand], levels=names(new.aer))
-  new.aer.reverse = factor(inferred.position[!strand] - actual.position[!strand], levels=names(new.aer))
+  new.aer.reverse = factor(-(inferred.position[!strand] - actual.position[!strand]), levels=names(new.aer))
   
   new.aer.forward.agg = aggregate(counts[strand], by=list(new.aer.forward), sum)
   new.aer.reverse.agg = aggregate(counts[!strand], by=list(new.aer.reverse), sum) 
@@ -164,9 +183,10 @@ calcAlignmentErrorRate = function(actual.position, inferred.position, strand, co
   new.aer[new.aer.forward.agg[,1]] = new.aer[new.aer.forward.agg[,1]] + new.aer.forward.agg[,2]
   new.aer[new.aer.reverse.agg[,1]] = new.aer[new.aer.reverse.agg[,1]] + new.aer.reverse.agg[,2]
   
-  new.aer = (new.aer + 1) / (sum(new.aer) + pseudo*window.len)
+  new.aer.raw = new.aer
+  new.aer = (new.aer + pseudo) / (sum(new.aer) + pseudo*window.len)
   
-  return(new.aer)
+  return(list(new.aer, new.aer.raw))
 }
 
 
@@ -186,8 +206,29 @@ get.max.ll = function(v, ties=c("left", "right")) {
 
 
 
+read.umi = function(qname, umi.flat) {
+  if(length(umi.flag) == 1 & class(umi.flag) %in% c("numeric", "integer")) {
+    umi = str_sub(qname, start=-umi.flag)
+  } else if(length(umi.flag) == 2 & class(umi.flag) %in% c("numeric", "integer")) {  
+    umi = str_sub(qname, start=umi.flag[1], end=umi.flag[2])
+  } else if(length(umi.flag) == 1 & class(umi.flag) == "character") {
+    umi = str_match(qname, pattern=umi.flag)[,2]
+    if(sum(is.na(umi)) > 0) {
+      stop(paste("UMIs not found for ", sum(is.na(umi)), " reads. Please check matching pattern", sep=""))
+    }
+  } else {
+    stop("umi.flag not in a recognized format. See ?barcodeEM for details.")
+  }
+  return(umi)
+}
 
 
+get.probability.matrix = function(umi.len, mer, aer) {
 
-
+  probs = do.call(cbind, lapply(1:length(aer), function(i) aer[i] * dbinom(x=0:umi.len, size=umi.len, prob=mer)))
+  rownames(probs) = 0:umi.len
+  colnames(probs) = names(aer)
+  
+  return(probs)
+}
 
