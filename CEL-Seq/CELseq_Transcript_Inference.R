@@ -42,12 +42,10 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
   strand = as.factor(strand(bamGA)) == "+"
   position[!strand] = end(bamGA)[!strand]
 
-  info = data.table(data.frame(chr=seqnames(bamGA), position=position, strand=strand, umi=umi, inferred_position=position, inferred_umi=umi))
-  info.counts = info[, `:=` (COUNT = .N, INITIAL_GRP=.GRP, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
-  info.counts = info.counts[,ID := 1:nrow(info.counts)]
-  info.counts[IX > 1,COUNT := 0]
-  info.counts.u = subset(info.counts, IX==1)
-     
+  reads = data.table(data.frame(qname=mcols(bamGA)$qname, chr=seqnames(bamGA), strand=strand, position=position, umi=umi, inferred_position=position, inferred_umi=umi))
+  reads[, `:=` (INITIAL_COUNT = .N, INITIAL_GRP=.GRP, INITIAL_GRP_IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
+  reads[, ID := 1:.N]
+           
   ## Set up shorthand variables for use in rest of script
   aer = alignment.error.rate
   names(aer) = as.character(-(window):(window))
@@ -55,116 +53,107 @@ barcodeEM = function(filename, window=10, umi.flag=5, mismatch.error.rate = 0.05
   mer = mismatch.error.rate
   w = window
   w.size = (2*w)+1
+  mer.full = list()
+  aer.full = list()
   
   ## Set up variables to save info after each iteration
-  previous.umi = info.counts$inferred_umi
-  previous.position = info.counts$inferred_position
-  mer.list = list()
-  aer.list = list()
-  info.list = list(info.counts.u)
-
+  previous.umi = reads$inferred_umi
+  previous.position = reads$inferred_position
   
   iter = 1
   continue = TRUE
   while(continue == TRUE & iter <= max.iter) {
     
-	next.umi = c()
-	next.position = c()
-
     ## Set up mismatch and alignment error probability matrix
     probs = get.probability.matrix(umi.len, mer, aer)
 
-	if(verbose) print(sprintf("Expectation ... Calculating most likely fragment memberships"))
+	## Calculate read fragment memebership based on lasted UMI/position assignment
+	reads = reads[, `:=` (COUNT = .N, GRP=.GRP, GRP_IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
+	reads.dedup = subset(reads, GRP_IX == 1)
+
+	next.umi = rep(NA, nrow(reads.dedup))
+	next.position = rep(NA, nrow(reads.dedup))
 	
-	for(ix in 1:nrow(info.counts.u)) {
-	  current.umi = as.character(info.counts.u[ix,inferred_umi])
-	  current.position = info.counts.u[ix,inferred_position]
-	  current.strand = info.counts.u[ix,strand]
-	  current.chr = info.counts.u[ix,chr]
+	## Identify most likely assignment for each read fragment group
+	if(verbose) print(sprintf("Expectation ... Calculating most likely fragment memberships"))	
+	for(ix in 1:nrow(reads.dedup)) {
+	  current.umi = as.character(reads.dedup[ix,inferred_umi])
+	  current.position = reads.dedup[ix,inferred_position]
+	  current.strand = reads.dedup[ix,strand]
+	  current.chr = reads.dedup[ix,chr]
 	
-	  reads.ix = info.counts.u$chr == current.chr & info.counts.u$inferred_position > (current.position-w) & info.counts.u$inferred_position < (current.position+w) & info.counts.u$strand == current.strand
+	  reads.ix = reads.dedup$chr == current.chr & reads.dedup$inferred_position > (current.position-w) & reads.dedup$inferred_position < (current.position+w) & reads.dedup$strand == current.strand
 
       ## Calculate UMI edit distance and genomic distance for each read within window
-      reads.dist = stringdist(current.umi, info.counts.u[reads.ix,inferred_umi])
+      reads.dist = stringdist(current.umi, reads.dedup[reads.ix,inferred_umi])
       if(current.strand == TRUE) {
-	    reads.pos = info.counts.u$inferred_position[reads.ix] - current.position
+	    reads.pos = reads.dedup$inferred_position[reads.ix] - current.position
       } else {
-        reads.pos = -(info.counts.u$inferred_position[reads.ix] - current.position)
+        reads.pos = -(reads.dedup$inferred_position[reads.ix] - current.position)
       }
 
-      reads.prob = diag(probs[as.character(reads.dist), as.character(reads.pos), drop=FALSE])
-      ll = log(reads.prob*info.counts.u$COUNT[reads.ix])
+      reads.prob = probs[cbind(reads.dist+1, reads.pos+w+1)]
+      ll = log(reads.prob*reads.dedup$COUNT[reads.ix])
 
 	  ties = ifelse(current.strand == TRUE, "left", "right")
 	  ll.max.ix = get.max.ll(ll, ties=ties)
 
-	  next.umi = c(next.umi, as.character(info.counts.u$inferred_umi[reads.ix][ll.max.ix]))
-	  next.position = c(next.position, info.counts.u$inferred_position[reads.ix][ll.max.ix])
+	  next.umi[ix] = as.character(reads.dedup$inferred_umi[reads.ix][ll.max.ix])
+	  next.position[ix] = reads.dedup$inferred_position[reads.ix][ll.max.ix]
 	}
  
 	if(verbose) print(sprintf("Maximization ... Calculating new mismatch error rate"))
-	mer.temp = calcMismatchErrorRate(info.counts.u$umi, next.umi, info.counts.u$COUNT)
+	mer.temp = calcMismatchErrorRate(reads.dedup$umi, next.umi, reads.dedup$COUNT)
 	mer = mer.temp[1]
-	mer.list = c(mer.list, list(mer.temp))
-  
+    mer.full = c(mer.full, list(mer.temp))  
+    
 	if(verbose) print(sprintf("Maximization ... Calculating new alignment error rate"))
-	aer.temp = calcAlignmentErrorRate(info.counts.u$position, next.position, info.counts.u$strand, info.counts.u$COUNT, window=w)
-	aer = aer.temp[[1]]
-	aer.list = c(aer.list, list(aer.temp))
-  
+	aer.temp = calcAlignmentErrorRate(reads.dedup$position, next.position, reads.dedup$strand, reads.dedup$COUNT, window=w)
+	aer = aer.temp[[1]]  
+    aer.full = c(aer.full, list(aer.temp))
     
-    info.counts.u$inferred_umi = next.umi
-    info.counts.u$inferred_position = next.position
-    
-    info.counts.u = info.counts.u[, `:=` (NEW_COUNT = sum(COUNT), NEW_IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi)]
-    info.counts.u[NEW_IX > 1,NEW_COUNT := 0]
-
-    id = info.counts.u$ID
-    info.counts$COUNT[id] = info.counts.u$NEW_COUNT
-    info.counts$inferred_umi[id] = info.counts.u$inferred_umi
-    info.counts$inferred_position[id] = info.counts.u$inferred_position
- 
-    info.counts.u = subset(info.counts.u, IX == 1)
-    info.counts.u[,`:=`(IX=NEW_IX,COUNT=NEW_COUNT,NEW_COUNT=NULL,NEW_IX=NULL)]      
-    
-    # Update current UMI and position assignments
-    info.list = c(info.list, list(info.counts.u))
+    id = as.numeric(reads.dedup$ID)
+    reads$inferred_umi[id] = next.umi
+    reads$inferred_position[id] = next.position
   
 	if(verbose) print(sprintf("Completed iteration %d", iter))
 	iter = iter + 1
 	
-	total.diff = sum(!(info.counts$inferred_umi == previous.umi & info.counts$inferred_position == previous.position))
+	total.diff = sum(!(reads$inferred_umi == previous.umi & reads$inferred_position == previous.position))
 	if(verbose) print(sprintf("Total number of reads that changed fragment membership: %d", total.diff))
 	if(total.diff == 0) {
 	  continue = FALSE
 	}
-	previous.umi = info.counts$inferred_umi
-	previous.position = info.counts$inferred_position
+	previous.umi = reads$inferred_umi
+	previous.position = reads$inferred_position
   }
   
   ## Make a final read matrix with duplicate infomation
-  final.counts = info.counts
-  final.counts[,`:=` (COUNT = NULL, IX = NULL)]
-  same.fragment = final.counts$umi == final.counts$inferred_umi & final.counts$position == final.counts$position
-  final.counts[,`:=` (same=same.fragment, duplicate = FALSE)]
-  final.counts = final.counts[, `:=` (FINAL_GRP = .GRP, COUNT = .N, IX=1:.N), by=list(chr, strand, inferred_position, inferred_umi, same)]
-  ind = final.counts$IX > 1 | !same.fragment
-  final.counts$duplicate[ind] = TRUE 
+  diff = !(reads$umi == reads$inferred_umi & reads$position == reads$position)
+  reads[,`:=` (COUNT = .N, GRP=.GRP, GRP_IX=1:.N, Is_Different=diff, Duplicate = FALSE)]
+  reads = reads[,DUPLICATE_IX := 1:.N, by=list(chr, strand, inferred_position, inferred_umi, Is_Different)]
+  ind = reads$DUPLICATE_IX > 1 | diff
+  reads$Duplicate[ind] = TRUE
+  reads[,DUPLICATE_IX := NULL]
 
-  return(list(final.counts, list(info.list, info.counts, aer, mer, aer.list, mer.list, next.umi, next.position)))
+  return(list(ga=bamGA[reads$Duplicate == FALSE], reads=reads, aer=aer, mer=mer, aer.full=aer.full, mer.full=mer.full))
 }
 
 calcMismatchErrorRate = function(actual.umi, inferred.umi, counts) {
   actual.umi = as.character(actual.umi)
   inferred.umi = as.character(inferred.umi)
-  c = cbind(as.character(actual.umi), as.character(inferred.umi))
-  l = unlist(lapply(1:nrow(c), function(i) stringDist(c(c[i,1], c[i,2]), method="hamming")[1]))
   
-  mer.num = sum(l*counts)
-  mer.denom = sum(counts*nchar(actual.umi[1]))
-  new.mer =  mer.num / mer.denom
+  edit.dist = rep(0, length(actual.umi))
+  ind = actual.umi != inferred.umi
   
-  return(c(new.mer, mer.num, mer.denom))
+  c = cbind(as.character(actual.umi[ind]), as.character(inferred.umi[ind]))
+  edit.dist[ind] = unlist(lapply(1:nrow(c), function(i) stringDist(c(c[i,1], c[i,2]), method="hamming")[1]))
+  
+  mer.mismatch = sum(edit.dist*counts)
+  mer.total = sum(counts*nchar(actual.umi[1]))
+  new.mer =  mer.mismatch / mer.total
+  
+  return(c(new.mer, mer.mismatch, mer.total))
 }
 
 
